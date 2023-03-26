@@ -1,4 +1,6 @@
-﻿using Microsoft.CodeAnalysis;
+﻿using FactoryGenerator.Annotations;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using System;
 using System.Collections.Generic;
@@ -19,17 +21,37 @@ public class FactoryGenerator : ISourceGenerator
 			foreach (var constructorGroup in reciever.Constructors.GroupBy(s => s.Parent))
 			{
 				var model = context.Compilation.GetSemanticModel(constructorGroup.Key!.SyntaxTree);
-				var type = model.GetDeclaredSymbol(constructorGroup.Key);
+				var type = (INamedTypeSymbol)model.GetDeclaredSymbol(constructorGroup.Key);
 				var typeName = type.Name;
-				context.AddSource($"{type.Name}Factory.g.cs", $@"
+				var constructors = constructorGroup.Select(c => model.GetDeclaredSymbol(c)!).ToArray();
+				var predicate = GetIsParameterPredicate(model);
+				var privateDependencyTypes = constructorGroup
+					.SelectMany(c => c.ParameterList.Parameters)
+					.Where(p => !predicate(p))
+					.Select(p => model.GetTypeInfo(p.Type).Type)
+					.Distinct((IEqualityComparer<ISymbol>)SymbolEqualityComparer.Default)
+					.ToArray();
+				var factoryName = $"{typeName}Factory";
+				var source = $@"
 namespace {GetNamespaceName(type.ContainingNamespace)}
 {{
-	public class X{{}}
-	public interface I{typeName}Factory
+	public interface I{factoryName}
 	{{
-		{GenerateCreateMethods(constructorGroup, model)}
+		{GenerateCreateMethods(type, constructors, model, privateDependencyTypes, true)}
 	}}
-}}");
+
+	public class {factoryName}: I{factoryName}
+	{{
+		{string.Join("\n", privateDependencyTypes.Select((t, index) => $"\t\tprivate readonly {GetNamespaceName(t.ContainingNamespace)}.{t.Name} _dependency{index};"))}
+		public {typeName}Factory({string.Join(", ", privateDependencyTypes.Select((t, index) => $"{GetNamespaceName(t.ContainingNamespace)}.{t.Name} dependency{index}"))})
+		{{
+			{string.Join("\n", privateDependencyTypes.Select((t, index) => $"_dependency{index} = dependency{index};"))}
+		}}
+		{GenerateCreateMethods(type, constructors, model, privateDependencyTypes, false)}
+
+	}}
+}}";
+				context.AddSource($"{type.Name}Factory.g.cs", source);
 				//var c = model.GetDeclaredSymbol(constructor);
 				//context.AddSource(c.ContainingType.Name, "test");
 			}
@@ -37,12 +59,54 @@ namespace {GetNamespaceName(type.ContainingNamespace)}
 		catch (Exception) { }
 	}
 
-	private string GenerateCreateMethods(IEnumerable<ConstructorDeclarationSyntax> constructorGroup, SemanticModel model)
+	private static Func<ParameterSyntax, bool> GetIsParameterPredicate(SemanticModel model)
 	{
+		return p => p.AttributeLists.Any(l => l.Attributes.Any(a =>
+		{
+			var annotationType = model.GetTypeInfo(a).Type!;
+			return annotationType.Name == nameof(ParameterAttribute) && annotationType.ContainingNamespace.Name == "Annotations";
+		}));
+	}
+
+	private static Func<IParameterSymbol, bool> GetIsParameterPredicateForSymbol(SemanticModel model)
+	{
+		return p => p.GetAttributes().Any(a =>
+		{
+			var annotationType = a.AttributeClass!;
+			return annotationType.Name == nameof(ParameterAttribute) && annotationType.ContainingNamespace.Name == "Annotations";
+		});
+	}
+
+	private string GenerateCreateMethods(
+		INamedTypeSymbol type,
+		IEnumerable<IMethodSymbol> constructors,
+		SemanticModel model,
+		ISymbol?[] privateDependencyTypes,
+		bool onlyHeader)
+	{
+		var predicate = GetIsParameterPredicateForSymbol(model);
 		return string.Join(
 			"\r\n",
-			constructorGroup.Select(constructor => "")
-			);
+			constructors.Select(constructor =>
+			{
+				var parameters = constructor.Parameters.Where(predicate).ToList();
+				var header = $"public {type} Create({string.Join(
+					",",
+					parameters.Select((p, index) => $"{p.Type} {p.Name}")
+					)})";
+				if (onlyHeader)
+					return header + ";";
+				return $@"{header}
+{{
+	return new {type}({string.Join(",", constructor.Parameters.Select(p =>
+				{
+					var comparer = SymbolEqualityComparer.Default;
+					if (predicate(p))
+						return parameters.First(parameter => comparer.Equals(parameter.Type, p.Type)).Name;
+					return $"_dependency{privateDependencyTypes.ToList().FindIndex(dependency => comparer.Equals(dependency, p.Type))}";
+				}))});
+}}";
+			}));
 	}
 
 	private static string GetNamespaceName(INamespaceSymbol symbol)
